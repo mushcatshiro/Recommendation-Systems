@@ -188,6 +188,74 @@ markus_ratings.groupBy("Genre").sum().show()
 
 ## ALS
 
-### matrix multiplication
+### matrix multiplication and matrix factorization
 
-### matrix factorization
+matrix factorization essentially decomposing the matrices, the opposite of matmul. ALS uses non-negative matrix factorization. some of the mf approximation will use negative values to predict positive value however it is undesired as it does not makse sense in this context (as a latent feature). ALS works well with sparsity. it uses RMSE to calculate how far it deviates from the points available in the original matrix.
+
+$$ R = U \cdot P $$
+
+`U` and `R` is held constant when `P` is adjusted, and held `U` `P` constant when `R` is adjusted. the process switches for each iteration.
+
+$$ U \cdot P = \hat{R} $$
+
+### data preparation for spark ALS
+
+we first need to convert into a long dense matrix, most spark ML algorithm will requires row based format data to work with
+
+```python
+users = long_ratings.select('userId').distinct()
+movies = long_ratings.select('movieId').distinct()
+
+from pyspark.sql_functions import monotonically_increasing_id
+users = users.coalesce(1) # increment by one, prevent id being repeated in different partition
+movies = movies.coalesce(1)
+users = users.withColumn("userIntId", monotonically_increasing_id()).persist() # persist is needed such that further modification wont modify its value
+movies = movies.withColumn("userIntId", monotonically_increasing_id()).persist()
+
+ratings_w_int_ids = long_ratings.join(users, 'userId', 'left).join(movies, 'variable', 'left')
+# or
+from pyspark.ml import col
+
+ratings_data = ratings_w_int_ids.select(
+    col('userIntId').alias('userId'),
+    col('variable').alias('movieId'),
+    col('rating')
+)
+```
+
+### ALS parameters and hyperparameters
+
+parameters: userCol, itemCol, ratingCol
+hyperparameters:
+
+- rank - number of latent features
+- maxIter - number of iterations
+- regParam - regularization
+- alpha - for implicit ratings
+- nonnegative - True
+- coldStartStrategy - prevent train test split issues
+- implicitPrefs - implicit or explicit rating
+
+```python
+(training_data, test_data) = ratings.randomSplit([0.8, 0.2], seed=42)
+
+from pyspark.ml.recommendation import ALS
+als = ALS(
+    userCol="userId",
+    itemCol="movieId",
+    ratingCol="rating",
+    rank=10,
+    maxIter=15,
+    regParam=0.1,
+    coldStartStrategy="drop",
+    nonnegative=True,
+    implicitPrefs=False
+)
+
+model = als.fit(training_data)
+test_predictions = model.transform(test_data)
+
+from pyspark.ml.evaluation import RegressionEvaluator
+evaluator = RegressionEvaluator(metricName="rmse", labelCol="ratings", predictionCol="prediction")
+RMSE = evaluator.evaluate(test_predictions)
+```
