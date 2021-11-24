@@ -21,6 +21,9 @@ flights = spark.sql(query)
 # or
 flights_df = flights.toPandas()
 flights.show()
+
+# view schema
+ratings.printSchema()
 ```
 
 ```mermaid
@@ -56,8 +59,11 @@ df = df.withColumn("newCol", df.oldCol + 1)
 # filter - WHERE
 
 long_flights1 = flights.filter("distance > 1000") # note extra space might not yield desired result
-#or
+# or
 long_flights2 = flights.filter(flights.distance > 1000)
+# or
+from pyspark.sql.functions import col
+ratings.filter(col("userId") < 100).show()
 
 # select - SELECT
 selected1 = flights.select("tailnum", "origin", "dest")
@@ -173,7 +179,7 @@ best_lr = models.bestModel
 evaluate
 
 ```python
-test_results = best_lr.transform(test) # why not fit?
+test_results = best_lr.transform(test) # note differences from sklearn
 evaluator.evaluate(test)
 ```
 
@@ -192,11 +198,13 @@ markus_ratings.groupBy("Genre").sum().show()
 
 matrix factorization essentially decomposing the matrices, the opposite of matmul. ALS uses non-negative matrix factorization. some of the mf approximation will use negative values to predict positive value however it is undesired as it does not makse sense in this context (as a latent feature). ALS works well with sparsity. it uses RMSE to calculate how far it deviates from the points available in the original matrix.
 
-$$ R = U \cdot P $$
-
+$$
+R = U \cdot P
+$$
 `U` and `R` is held constant when `P` is adjusted, and held `U` `P` constant when `R` is adjusted. the process switches for each iteration.
-
-$$ U \cdot P = \hat{R} $$
+$$
+U \cdot P \simeq \hat{R}
+$$
 
 ### data preparation for spark ALS
 
@@ -259,3 +267,75 @@ from pyspark.ml.evaluation import RegressionEvaluator
 evaluator = RegressionEvaluator(metricName="rmse", labelCol="ratings", predictionCol="prediction")
 RMSE = evaluator.evaluate(test_predictions)
 ```
+
+### real dataset (MovieLens)
+
+$$
+Sparsity = \frac{\text{Number of Ratings in Matrix}}{(\text{number of users}) * (\text{number of movies})}
+$$
+
+### performance evaluations
+
+````python
+original_ratings.filter(col("userId") == 60).sort("rating", ascending = False).show()
+recommendations.filter(col("userId") == 60).show()
+````
+
+## Implicit Ratings and Million Songs Dataset
+
+```python
+users = Z.select("userId").distinct()
+products = Z.select("productId").distinct()
+cj = users.crossJoin(products)
+Z_expanded = cj.join(Z, ["userId", "productId"], "left").fillna(0)
+```
+
+the hyperparameter alpha is used to tell me model how much each additional songs is required to add confidence. the challenge for implicit ratings is the evaluations, which we don't have the same metrics. we only have the implicit rating confidence. instead we use ROEM, rank ordering error metric
+$$
+ROEM = \frac{\sum_{u, i}{r^t_{u, i} rank_{u, i}}}{\sum_{u, i}{r^t_{u, i}}}
+$$
+basically it checks if the songs with higher number of plays have higher predictions. ROEM is not provided in spark we need to build manually. note manual algorithms's need to be implemented such that other operation in the pipeline eg. cross validation, grid search are compatible.
+
+```python
+for r in ranks:
+    for mi in maxIters:
+        for rp in regParams:
+            for a in alphas:
+                model_list.append(ALS(userCol= "userId", itemCol= "songId", ratingCol= "num_plays", rank = r, maxIter = mi, regParam = rp, alpha = a, coldStartStrategy="drop", nonnegative = True, implicitPrefs = True))
+print(model_list, "Length of model_list: ", len(model_list))
+assert len(model_list) == (len(ranks)*len(maxIters)*len(regParams)*len(alphas))
+
+(training, test) = msd.randomSplit([0.8, 0.2])
+train1, train2, train3, train4, train5 = training.randomSplit([0.2, 0.2, 0.2, 0.2, 0.2], seed = 1)
+fold1 = train2.union(train3).union(train4).union(train5)
+fold2 = train3.union(train4).union(train5).union(train1)
+fold3 = train4.union(train5).union(train1).union(train2)
+fold4 = train5.union(train1).union(train2).union(train3)
+fold5 = train1.union(train2).union(train3).union(train4)
+
+foldlist = [(fold1, train1), (fold2, train2), (fold3, train3), (fold4, train4), (fold5, train5)]
+ROEMS = []
+for model in model_list:
+    for ft_pair in foldlist:
+        fitted_model = model.fit(ft_pair[0])
+        predictions = fitted_model.transform(ft_pair[1])
+        r = ROEM(predictions)
+        print("ROEM: ", r)
+    v_fitted_model = model.fit(training)
+    v_predictions = v_fitted_model.transform(test)
+    v_ROEM = ROEM(v_predictions)
+    ROEMS.append(v_ROEM)
+    print("Validation ROEM: ", v_ROEM)
+```
+
+### binary implicit ratings
+
+in some situation we only have information of if the user have or not done some action, but without information how many times or how much they actually like them, we can still feed binary data into ALS with ROEM. ALS can still make meaningful predictions. note if we uses explicit mode for ALS it will predict everything as 1 to ensure RMSE is 0. also we are dealing with imbalanced dataset here (check sparsity) however ROEM is not affected like it would on RMSE. some tricks we can use eg. item weighting, instead of putting unseen movies 0, we can weight them higher if lots of people have seen them with the assumption if more people like it, it should be good (duh...), or user weighting, where user that seen lots of movies will have lower weights to unseen movies.
+
+___
+
+## reference
+
+- [manual implementation of utils functions](https://github.com/jamenlong/ALS_expected_percent_rank_cv)
+- [item weighting?](http://yifanhu.net/PUB/cf.pdf)
+- [user weighting?](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.306.4684&rep=rep1&type=pdf)
